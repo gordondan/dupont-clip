@@ -48,12 +48,20 @@ REFERENCE = [("DupontClip", dict(n_positions=4), False, True),
 
 
 def main():
+    # The STLs are reproducible -- a fresh clone regenerates them byte for byte.
+    # The .FCStd files are NOT: FreeCAD stamps every save, so rewriting them
+    # dirties two binary files in git on every export with no real change.  So
+    # only rebuild them when asked, or when they are missing.
     for name, params, mocks, posed in REFERENCE:
+        path = os.path.join(HERE, name + ".FCStd")
+        if os.path.exists(path) and not os.environ.get("REBUILD_DOCS"):
+            print("kept   %s  (REBUILD_DOCS=1 to rebuild)" % path)
+            continue
         doc = App.newDocument(name)
         p = dict(params)
         p["export"] = False                      # the loop below owns generated/
         mod.generate(p, doc=doc, mocks=mocks, posed=posed)
-        doc.saveAs(os.path.join(HERE, name + ".FCStd"))
+        doc.saveAs(path)
         print("saved %s" % doc.FileName)
 
     written, bad = [], []
