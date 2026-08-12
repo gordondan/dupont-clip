@@ -1,0 +1,583 @@
+# -*- coding: utf-8 -*-
+"""
+WireGuideGen -- parametric generator for the wire-harness set.
+
+Produces four printable solids for a given connector size and wire map:
+
+    Guide         base plate + one channel per USED position.  Unused positions
+                  are left solid so no wire can be routed through them.
+    Lid           C-channel cap that snaps over the guide.  Carries a rib over
+                  every used channel that reaches down to leave exactly
+                  `clearance` above the wire.
+    SimpleCollar  plain tube that wraps a Dupont-style jumper.
+    HoodedCollar  two-stage collar: bore over the guide, counterbore over the
+                  assembled guide+lid, joined by 45-degree ramps so it prints
+                  without supports in either vertical orientation.
+
+Key dimensional chain (all driven, nothing hard-coded):
+
+    wall        = (pitch - wire_dia) / 2      channel wall
+    channel     = wire_dia wide, `pitch` deep
+    guide_h     = base_thk + pitch
+    pad_depth   = pitch - wire_dia - clearance
+                  -> rib underside sits exactly `clearance` above the wire,
+                     because headroom = pitch - wire_dia.
+
+Ramp lengths are computed as hypot(da, db) across each step so that the
+CORNERS -- not just the flats -- stay at 45 degrees or steeper.  A ramp sized
+only for the flats leaves the corners shallower, because a corner has to
+travel diagonally while rising the same amount.
+"""
+
+import math
+import FreeCAD as App
+import Part
+from FreeCAD import Vector as V
+
+__title__ = "WireGuideGen"
+__author__ = "generated for the WireGuide project"
+
+
+# --------------------------------------------------------------------------
+# parameters
+# --------------------------------------------------------------------------
+
+DEFAULTS = dict(
+    n_positions       = 4,      # connector positions (stays full size for board fit)
+    used              = "all",   # "all", "1-6", "1,3,5-7" ... 1-based
+    wire_dia          = 1.6,
+    pitch             = 2.54,
+    clearance         = 0.4,     # DESIGN clearance -- what the fit should be
+
+    # PRINTER compensation, per side, added to internal openings ONLY.  FDM
+    # lays holes undersized (over-extrusion, corner rounding), so a bore that
+    # is nominally correct still comes out tight.  Keep this separate from
+    # `clearance`: clearance is design intent and belongs in the drawing,
+    # this is a property of the machine.  Measure a printed bore against the
+    # model number the macro reports, halve the difference, put it here.
+    # 0.0 leaves every dimension exactly as designed.
+    bore_comp         = 0.0,
+
+    guide_length      = 14.0,    # along the wire run
+    base_thk          = 0.6,
+
+    lid_plate         = 2.0,     # top plate thickness
+    rail_thk          = 1.5,     # side rail thickness
+    lid_corner_r      = 1.5,
+    barb_reach        = 1.03,    # snap barb inward reach under the guide base
+    barb_drop         = 0.43,    # how far the rails hang below the guide base
+
+    jumper_w          = 2.5,     # Dupont jumper head, across the row
+    jumper_h          = 2.2,     # Dupont jumper head, through the row
+    hood_blank_len    = 3.0,     # comb thickness in the hood's skinny section
+
+    simple_wall       = 1.0,
+    simple_corner_r   = 1.0,
+    simple_len        = 14.0,
+    dupont_h          = 2.54,    # UNUSED -- superseded by the measured jumper_h.
+                                 # It guessed 2.54; the real head is 2.20, which
+                                 # is why the collar was sized off a proxy.
+
+    hood_wall         = 1.5,
+    hood_corner_r     = 1.0,
+    hood_guide_len    = 14.0,    # bore section, over the guide
+    hood_counterbore  = 14.0,    # counterbore depth from the outer edge
+    hood_bind_len     = 3.0,    # axial overlap that binds the two stages
+
+    spacing           = 15.0,    # layout gap between parts in the document
+)
+
+
+def parse_used(spec, n):
+    """'all' | '1-6' | '1,3,5-7'  ->  sorted set of 0-based indices."""
+    spec = str(spec).strip().lower()
+    if spec in ("", "all", "*"):
+        return set(range(n))
+    out = set()
+    for chunk in spec.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            for i in range(int(a), int(b) + 1):
+                out.add(i - 1)
+        else:
+            out.add(int(chunk) - 1)
+    bad = sorted(i + 1 for i in out if i < 0 or i >= n)
+    if bad:
+        raise ValueError("positions out of range 1..%d: %s" % (n, bad))
+    return out
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+
+def rrect_wire(w, h, r, z=0.0):
+    """Rounded rectangle wire centred on the origin, in the XY plane at height z.
+
+    Edges are always emitted in the same order starting from the same corner,
+    so two wires from this function correspond edge-for-edge.  That matters:
+    lofting via Part.Face(...).OuterWire instead lets face construction
+    reorder the edges, and the loft then twists -- corner surfaces smear
+    across the flats and the ramp angle collapses well below 45 degrees.
+    """
+    a, b = w / 2.0, h / 2.0
+    r = max(0.0, min(r, a - 1e-6, b - 1e-6))
+    if r <= 1e-9:
+        pts = [V(-a, -b, z), V(a, -b, z), V(a, b, z), V(-a, b, z), V(-a, -b, z)]
+        return Part.makePolygon(pts)
+    ca, cb = a - r, b - r
+    e = []
+    e.append(Part.LineSegment(V(-ca, -b, z), V(ca, -b, z)).toShape())
+    e.append(Part.ArcOfCircle(Part.Circle(V(ca, -cb, z), V(0, 0, 1), r),
+                              -math.pi / 2, 0).toShape())
+    e.append(Part.LineSegment(V(a, -cb, z), V(a, cb, z)).toShape())
+    e.append(Part.ArcOfCircle(Part.Circle(V(ca, cb, z), V(0, 0, 1), r),
+                              0, math.pi / 2).toShape())
+    e.append(Part.LineSegment(V(ca, b, z), V(-ca, b, z)).toShape())
+    e.append(Part.ArcOfCircle(Part.Circle(V(-ca, cb, z), V(0, 0, 1), r),
+                              math.pi / 2, math.pi).toShape())
+    e.append(Part.LineSegment(V(-a, cb, z), V(-a, -cb, z)).toShape())
+    e.append(Part.ArcOfCircle(Part.Circle(V(-ca, -cb, z), V(0, 0, 1), r),
+                              math.pi, 3 * math.pi / 2).toShape())
+    return Part.Wire(e)
+
+
+def rrect_face(w, h, r, z=0.0):
+    return Part.Face(rrect_wire(w, h, r, z))
+
+
+def rrect_prism(w, h, r, z0, z1):
+    return rrect_face(w, h, r, z0).extrude(V(0, 0, z1 - z0))
+
+
+def rrect_ramp(w0, h0, w1, h1, r, z0, z1):
+    """Straight 45-degree ramp between two rounded rects of equal corner radius.
+
+    Built edge-by-edge with makeRuledSurface rather than Part.makeLoft.
+    makeLoft matches the two wires by normalised arc length along the WHOLE
+    wire; since the profiles have different perimeters, the corner arcs land
+    at different normalised positions and the loft smears them across the
+    flats -- which quietly drops the corner slope to ~25-30 degrees while the
+    flats still read 45.  Ruling corresponding edge pairs keeps the arcs
+    paired with the arcs, so every ruling is a straight line and the corners
+    hold the angle the caller asked for.
+    """
+    a = rrect_wire(w0, h0, r, z0)
+    b = rrect_wire(w1, h1, r, z1)
+    if len(a.Edges) != len(b.Edges):
+        raise ValueError("ramp profiles must have matching edge counts")
+    faces = [Part.makeRuledSurface(a.Edges[i], b.Edges[i])
+             for i in range(len(a.Edges))]
+    faces += [Part.Face(a), Part.Face(b)]
+    return Part.Solid(Part.Shell(faces))
+
+
+def ramp_len(w0, h0, w1, h1):
+    """Axial rise that keeps the shallowest direction (the corner) at >= 45 deg."""
+    return math.hypot(abs(w1 - w0) / 2.0, abs(h1 - h0) / 2.0)
+
+
+# --- single source of truth for the stack-up, so the collars cannot drift ---
+
+def gap(P):
+    """Total per-side allowance on an internal opening: design + printer."""
+    return P["clearance"] + P["bore_comp"]
+
+
+def guide_dims(P):
+    """(width, height) of the guide solid."""
+    return P["n_positions"] * P["pitch"], P["base_thk"] + P["pitch"]
+
+
+def lid_dims(P):
+    """(width, height) of the lid solid, matching build_lid exactly."""
+    w, _ = guide_dims(P)
+    ow = w + 2 * gap(P) + 2 * P["rail_thk"]
+    oh = (P["pitch"] + P["lid_plate"]) + P["base_thk"] + P["barb_drop"]
+    return ow, oh
+
+
+# --------------------------------------------------------------------------
+# part builders   (guide frame: X = width, Y = wire run, Z = up)
+# --------------------------------------------------------------------------
+
+def build_guide(P, used):
+    n, pitch, wire = P["n_positions"], P["pitch"], P["wire_dia"]
+    L, base = P["guide_length"], P["base_thk"]
+    w = n * pitch
+    wall = (pitch - wire) / 2.0
+
+    # one solid block: base plate + full-height cell row
+    body = Part.makeBox(w, L, base + pitch, V(0, 0, -base))
+
+    # cut a channel only where a wire is actually routed; the rest stays solid.
+    # width carries bore_comp (it is an opening); depth stays exactly `pitch`
+    # because the lid rib formula is derived from it.
+    bc = P["bore_comp"]
+    for i in sorted(used):
+        x0 = i * pitch + wall - bc
+        body = body.cut(Part.makeBox(wire + 2 * bc, L + 2.0, pitch, V(x0, -1.0, 0)))
+    return body.removeSplitter()
+
+
+def build_lid(P, used):
+    n, pitch, wire = P["n_positions"], P["pitch"], P["wire_dia"]
+    L, base, c = P["guide_length"], P["base_thk"], P["clearance"]
+    rail, plate, r = P["rail_thk"], P["lid_plate"], P["lid_corner_r"]
+    w = n * pitch
+    wall = (pitch - wire) / 2.0
+
+    # the guide slides in with `gap` a side, so the rails sit outboard of that
+    # -- otherwise the cut eats into the rail thickness
+    g = gap(P)
+    ow, ol = w + 2 * g + 2 * rail, L + 2 * rail  # outer footprint
+    z_bot = -base - P["barb_drop"]               # rail bottom
+    z_top = pitch + plate                        # outside of the top plate
+
+    shell = rrect_prism(ow, ol, r, z_bot, z_top)
+    shell.translate(V(w / 2.0, L / 2.0, 0))      # centre it on the guide
+
+    # hollow out everything the guide occupies, leaving top plate + two rails
+    cav = Part.makeBox(w + 2 * g, ol + 2.0, pitch - z_bot + 1.0,
+                       V(-g, -rail - 1.0, z_bot - 1.0))
+    lid = shell.cut(cav)
+
+    # snap barbs: triangular hooks that catch under the guide base.  They must
+    # start ON the rail inner face (x = -c / w+c), not on the guide edge, or
+    # they float free of the lid as separate solids.
+    br, bd = P["barb_reach"], P["barb_drop"]
+    for x_in, sgn in ((-g, 1.0), (w + g, -1.0)):
+        pts = [V(x_in, 0, -base),
+               V(x_in + sgn * br, 0, -base),
+               V(x_in, 0, -base - bd),
+               V(x_in, 0, -base)]
+        tri = Part.Face(Part.makePolygon(pts))
+        lid = lid.fuse(tri.extrude(V(0, ol, 0)).translate(V(0, -rail, 0)))
+
+    # ribs: one per USED channel, reaching down to leave `clearance` on the wire
+    pad_depth = pitch - wire - c
+    pad_w = max(wire - 2 * c, 0.2)
+    if pad_depth > 1e-6:
+        for i in sorted(used):
+            x0 = i * pitch + wall + (wire - pad_w) / 2.0
+            lid = lid.fuse(Part.makeBox(pad_w, L, pad_depth,
+                                        V(x0, 0, pitch - pad_depth)))
+    return lid.removeSplitter()
+
+
+def slot_size(P):
+    """Opening for one jumper head: head + full clearance, deliberately unclamped.
+
+    The slot is wider than `pitch` (3.30 vs 2.54 on the defaults), so adjacent
+    slots overlap.  That is fine and is what "fill unused only" means -- two
+    adjacent USED positions merge into one opening.  Do NOT clamp this to
+    `pitch` to stop the overlap: with a 2.50 head on a 2.54 pitch that leaves
+    +0.02 a side, which is a press fit, not a clearance fit.
+
+    Blanking still works because a blanked position only loses the overlap on
+    each side.  Worst case -- both neighbours used -- it retains
+    (2*pitch - slot_w) of solid, 1.78 on the defaults, which a 2.50 head
+    cannot pass.  `blank_residual` reports it.
+    """
+    return (P["jumper_w"] + 2 * gap(P),
+            P["jumper_h"] + 2 * gap(P))
+
+
+def blank_residual(P):
+    """Solid left at a blanked position whose neighbours are both open."""
+    return 2 * P["pitch"] - slot_size(P)[0]
+
+
+def comb(P, used, solid, bw, bh, r, z0, z1):
+    """Blank the bore across [z0,z1], then re-open only the used positions.
+
+    Stops the jumper heads swinging sideways once the guide+lid are seated:
+    an unused position becomes solid plastic, so nothing can drift into it.
+    """
+    w = P["n_positions"] * P["pitch"]
+    sw, sh = slot_size(P)
+    out = solid.fuse(rrect_prism(bw, bh, r, z0, z1))
+    for i in sorted(used):
+        xc = (i + 0.5) * P["pitch"] - w / 2.0
+        out = out.cut(Part.makeBox(sw, sh, (z1 - z0) + 2.0,
+                                   V(xc - sw / 2.0, -sh / 2.0, z0 - 1.0)))
+    return out
+
+
+def build_simple_collar(P, used):
+    """Plain tube wrapping a Dupont-style jumper, combed over its full length."""
+    n, pitch, c = P["n_positions"], P["pitch"], P["clearance"]
+    wall, r, ln = P["simple_wall"], P["simple_corner_r"], P["simple_len"]
+    # Driven off the MEASURED housing, not off n*pitch.  n*pitch assumed the
+    # housing was exactly one pitch per position; the real envelope is
+    # (n-1) pitches between head centres plus one head width.
+    bw = (n - 1) * pitch + P["jumper_w"] + 2 * gap(P)
+    bh = P["jumper_h"] + 2 * gap(P)
+    outer = rrect_prism(bw + 2 * wall, bh + 2 * wall, r + wall, 0, ln)
+    bore = rrect_prism(bw, bh, r, -1.0, ln + 1.0)
+    tube = outer.cut(bore)
+    # the heads pass all the way through, so the comb runs the full length
+    tube = comb(P, used, tube, bw, bh, r, 0.0, ln)
+    # built axis-along-Z, i.e. already standing vertical for printing
+    return tube.removeSplitter()
+
+
+def build_hooded_collar(P, used):
+    """Two-stage collar: bore over the guide, counterbore over guide+lid."""
+    c = P["clearance"]
+    wall, r = P["hood_wall"], P["hood_corner_r"]
+    # hood_guide_len is the guide's INSERTION DEPTH.  The comb sits beyond it,
+    # so the skinny section has to be that much longer -- otherwise the comb
+    # eats into the insertion and the guide seats short.
+    L1 = P["hood_guide_len"] + P["hood_blank_len"]
+    L2 = P["hood_counterbore"]
+
+    w, guide_h = guide_dims(P)
+    lid_w, lid_h = lid_dims(P)
+
+    g = gap(P)
+    bw0, bh0 = w + 2 * g, guide_h + 2 * g            # bore, guide side
+    bw1, bh1 = lid_w + 2 * g, lid_h + 2 * g          # counterbore, lid side
+    ow0, oh0 = bw0 + 2 * wall, bh0 + 2 * wall
+    ow1, oh1 = bw1 + 2 * wall, bh1 + 2 * wall
+    r = min(r, bh0 / 2.0 - 1e-3)
+
+    total = L1 + L2
+    Lr = ramp_len(bw0, bh0, bw1, bh1)                # same for bore and OD
+    z_flare = max(Lr + 1e-3, L1 - P["hood_bind_len"])
+
+    # outer envelope: small OD, 45 deg flare, large OD
+    outer = rrect_prism(ow0, oh0, r, 0, z_flare - Lr)
+    outer = outer.fuse(rrect_ramp(ow0, oh0, ow1, oh1, r, z_flare - Lr, z_flare))
+    outer = outer.fuse(rrect_prism(ow1, oh1, r, z_flare, total))
+
+    # bore: small bore, 45 deg funnel, counterbore
+    bore = rrect_prism(bw0, bh0, r, -1.0, L1 - Lr)
+    bore = bore.fuse(rrect_ramp(bw0, bh0, bw1, bh1, r, L1 - Lr, L1))
+    bore = bore.fuse(rrect_prism(bw1, bh1, r, L1, total + 1.0))
+
+    hood = outer.cut(bore)
+
+    # Comb in the SKINNY section, at the free (pin) end.  This is where the
+    # jumper heads emerge once the guide+lid are seated in the counterbore,
+    # and with the bore fully open they can still swing sideways.
+    bl = max(0.0, min(P["hood_blank_len"], L1 - Lr))
+    if bl > 1e-6:
+        hood = comb(P, used, hood, bw0, bh0, r, 0.0, bl)
+
+    # built axis-along-Z: guide bore at z=0, counterbore at z=total.  The print
+    # orientation step flips it so the wide counterbore end lands on the bed.
+    return hood.removeSplitter()
+
+
+# --------------------------------------------------------------------------
+# print orientation
+# --------------------------------------------------------------------------
+#
+# Every part is rotated into the pose it should be sliced in and then dropped
+# so its lowest point sits exactly on Z=0.  A common bed plane matters: if one
+# part floats, the slicer either adds a raft under it or reports "slicing in
+# air" and the layer numbering no longer lines up between parts.
+#
+#   Guide   as built -- the base underside is already the largest flat face,
+#           and it is the only face that is flat across the whole footprint
+#           (the top is broken up by the channels).
+#   Lid     flipped 180 deg.  Its largest flat face is the OUTSIDE of the top
+#           plate; as built that faces up, with the rails and ribs pointing
+#           down.  Flipping puts the plate on the bed and the rails/ribs in
+#           the air, which also removes every downward-facing feature.
+#   Collars stand on end.  Both are built axis-along-Z already; the hood is
+#           flipped so the wide counterbore end is on the bed for the larger
+#           footprint.  Both are support-free either way up (verified), so
+#           this is purely a stability choice.
+
+PRINT_POSE = {
+    "Guide":        (None,         0.0),
+    "Lid":          (V(1, 0, 0), 180.0),
+    "SimpleCollar": (None,         0.0),
+    "HoodedCollar": (V(1, 0, 0), 180.0),
+}
+
+
+def pose_for_print(shape, axis, angle):
+    """Rotate into the print pose, then seat the part on the Z=0 bed plane."""
+    s = shape.copy()
+    if axis is not None and abs(angle) > 1e-9:
+        s.rotate(V(0, 0, 0), axis, angle)
+    bb = s.BoundBox
+    s.translate(V(-bb.XMin, -bb.YMin, -bb.ZMin))
+    return s
+
+
+# --------------------------------------------------------------------------
+# document assembly
+# --------------------------------------------------------------------------
+
+def generate(params=None, doc=None):
+    P = dict(DEFAULTS)
+    P.update(params or {})
+    n = int(P["n_positions"])
+    used = parse_used(P["used"], n)
+
+    if P["wire_dia"] >= P["pitch"]:
+        raise ValueError("wire_dia (%.3f) must be less than pitch (%.3f)"
+                         % (P["wire_dia"], P["pitch"]))
+
+    if doc is None:
+        doc = App.newDocument("WireGuide_%dp_%dused" % (n, len(used)))
+
+    parts = [
+        ("Guide",        build_guide(P, used),        (1.00, 0.35, 0.35)),
+        ("Lid",          build_lid(P, used),          (0.30, 0.55, 1.00)),
+        ("SimpleCollar", build_simple_collar(P, used), (0.40, 0.90, 0.40)),
+        ("HoodedCollar", build_hooded_collar(P, used), (0.95, 0.80, 0.20)),
+    ]
+
+    y = 0.0
+    report = []
+    for name, shape, col in parts:
+        axis, angle = PRINT_POSE[name]
+        shape = pose_for_print(shape, axis, angle)
+        # lay out along Y only -- translation in X/Y keeps the part on the bed
+        shape.translate(V(0, y, 0))
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        if obj.ViewObject:
+            obj.ViewObject.ShapeColor = col
+        bb = shape.BoundBox
+        y += bb.YLength + P["spacing"]
+        report.append((name, len(shape.Solids), shape.isValid(), shape.Volume,
+                       bb.XLength, bb.YLength, bb.ZLength, bb.ZMin))
+
+    doc.recompute()
+
+    wall = (P["pitch"] - P["wire_dia"]) / 2.0
+    print("WireGuideGen  %d positions, %d used %s"
+          % (n, len(used), sorted(i + 1 for i in used)))
+    print("  pitch %.3f  wire %.3f  clearance %.3f  ->  wall %.3f, channel %.3f deep"
+          % (P["pitch"], P["wire_dia"], P["clearance"], wall, P["pitch"]))
+    print("  lid rib depth = pitch - wire - clearance = %.3f  (leaves %.3f on the wire)"
+          % (P["pitch"] - P["wire_dia"] - P["clearance"], P["clearance"]))
+
+    print("  openings = design clearance %.3f + printer bore_comp %.3f = %.3f a side"
+          % (P["clearance"], P["bore_comp"], gap(P)))
+    sw, sh = slot_size(P)
+    res = blank_residual(P)
+    blanked = sorted(i + 1 for i in set(range(n)) - used)
+    print("  comb: head %.2f x %.2f -> slot %.2f x %.2f; blanked %s"
+          % (P["jumper_w"], P["jumper_h"], sw, sh, blanked or "none"))
+    print("        blank left at a gap between two open slots = %.3f  %s"
+          % (res, "blocks the head" if res < P["jumper_w"] else
+                  "TOO WIDE -- a head could pass"))
+    hw = (n - 1) * P["pitch"] + P["jumper_w"]
+    print("  simple collar bore, from measured housing %.2f x %.2f  ->  MODEL %.3f x %.3f"
+          % (hw, P["jumper_h"], hw + 2 * gap(P), P["jumper_h"] + 2 * gap(P)))
+    print("        measure the PRINTED bore; bore_comp += (model - printed)/2")
+    print("  hood skinny section = insertion %.2f + comb %.2f = %.2f"
+          % (P["hood_guide_len"], P["hood_blank_len"],
+             P["hood_guide_len"] + P["hood_blank_len"]))
+    print("  print orientation (all parts seated on Z=0):")
+    for name, ns, ok, vol, dx, dy, dz, z0 in report:
+        print("    %-13s solids=%d valid=%-5s vol=%9.2f  %6.2f x %6.2f x %6.2f  Zmin=%.3f"
+              % (name, ns, ok, vol, dx, dy, dz, z0))
+    report_fits(doc, P)
+    return doc
+
+
+def report_fits(doc, P):
+    """Measure the actual bores against the actual parts, per side.
+
+    The hood now stands axis-along-Z and is flipped counterbore-down, so the
+    two stations are derived from that pose.  Only two slices: slicing the
+    ramped hood is expensive enough that scanning it stalls the GUI thread.
+    """
+    hood = doc.getObject("HoodedCollar").Shape
+    gb = doc.getObject("Guide").Shape.BoundBox
+    lb = doc.getObject("Lid").Shape.BoundBox
+    z0 = hood.BoundBox.ZMin
+
+    L1, L2 = P["hood_guide_len"], P["hood_counterbore"]
+    total = L1 + L2
+    # after the flip, Z_final = total - z_built
+    z_bore = total - (L1 * 0.5)      # inside the guide bore section
+    z_cbore = L2 * 0.5               # inside the counterbore section
+
+    def bore_at(z):
+        sec = hood.slice(V(0, 0, 1), z0 + z)
+        if len(sec) < 2:
+            return None
+        w = min(sec, key=lambda x: x.BoundBox.XLength).BoundBox
+        return w.XLength, w.YLength
+
+    print("  fit check (clearance a side, target %.3f):" % P["clearance"])
+    for label, z, ref in (("guide in bore ", z_bore, (gb.XLength, gb.ZLength)),
+                          ("lid in c'bore ", z_cbore, (lb.XLength, lb.ZLength))):
+        got = bore_at(z)
+        if got is None:
+            print("    %s  -- no bore at z=%.2f" % (label, z))
+            continue
+        dx, dz = (got[0] - ref[0]) / 2.0, (got[1] - ref[1]) / 2.0
+        flag = "OK " if dx > 1e-6 and dz > 1e-6 else "TIGHT"
+        print("    %s bore %6.2f x %5.2f  part %6.2f x %5.2f  ->  %+.3f / %+.3f  %s"
+              % (label, got[0], got[1], ref[0], ref[1], dx, dz, flag))
+
+
+# --------------------------------------------------------------------------
+# dialog
+# --------------------------------------------------------------------------
+
+FIELDS = [
+    ("n_positions",      "Connector positions",          "int"),
+    ("used",             "Positions used (e.g. 1-6)",    "str"),
+    ("wire_dia",         "Wire diameter (mm)",           "float"),
+    ("pitch",            "Pitch (mm)",                   "float"),
+    ("clearance",        "Clearance (mm)",               "float"),
+    ("bore_comp",        "Printer bore comp (mm/side)",  "float"),
+    ("jumper_w",         "Jumper head width (mm)",       "float"),
+    ("jumper_h",         "Jumper head height (mm)",      "float"),
+    ("hood_blank_len",   "Hood comb thickness (mm)",     "float"),
+    ("guide_length",     "Guide length (mm)",            "float"),
+    ("base_thk",         "Guide base thickness (mm)",    "float"),
+    ("lid_plate",        "Lid plate thickness (mm)",     "float"),
+    ("rail_thk",         "Lid rail thickness (mm)",      "float"),
+    ("hood_counterbore", "Hood counterbore depth (mm)",  "float"),
+    ("hood_bind_len",    "Hood bind overlap (mm)",       "float"),
+]
+
+
+def show_dialog():
+    from PySide import QtWidgets
+
+    dlg = QtWidgets.QDialog()
+    dlg.setWindowTitle("Wire Guide Generator")
+    form = QtWidgets.QFormLayout(dlg)
+    widgets = {}
+    for key, label, kind in FIELDS:
+        w = QtWidgets.QLineEdit(str(DEFAULTS[key]))
+        form.addRow(label, w)
+        widgets[key] = (w, kind)
+
+    box = QtWidgets.QDialogButtonBox(
+        QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+    form.addRow(box)
+    box.accepted.connect(dlg.accept)
+    box.rejected.connect(dlg.reject)
+
+    if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        return None
+
+    params = {}
+    for key, (w, kind) in widgets.items():
+        t = w.text().strip()
+        params[key] = int(t) if kind == "int" else (float(t) if kind == "float" else t)
+    try:
+        return generate(params)
+    except Exception as exc:
+        QtWidgets.QMessageBox.critical(dlg, "Wire Guide Generator", str(exc))
+        raise
+
+
+if __name__ == "__main__":
+    show_dialog()

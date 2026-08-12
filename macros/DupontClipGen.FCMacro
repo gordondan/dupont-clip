@@ -1,0 +1,746 @@
+# -*- coding: utf-8 -*-
+"""DupontClipGen -- parametric generator for a two-part Dupont jumper clip.
+
+Supersedes the Guide / Lid / SimpleCollar / HoodedCollar set in
+WireGuideGen.FCMacro.  That set needed four parts and could not be assembled
+reliably: the collars had to be threaded on over the heads, and the lid's snap
+rails were 1.5 mm thick and only ~4 mm tall, so making them spread 1 mm meant
+straining them ~7 % -- far past where printed PLA yields.  Both problems are
+geometric, not dimensional, so this is a redesign rather than a retune.
+
+Two parts:
+
+    Clip   one solid carrying, front to back:
+             - front lip      a low shelf across the front that the heads butt
+                              against.  Its top is HIGHER than the head's total
+                              vertical play, so a head cannot climb over it --
+                              that is the whole front retention scheme, and it
+                              needs no overhanging feature anywhere.
+             - head pocket    one slot per USED position, sized on the measured
+                              head.  Slots overlap, so a full row is one trough
+                              and an unused position is left as a solid rib.
+             - wire channel   one channel per used position, floor set so the
+                              channel axis is COLLINEAR with the head axis, so
+                              the wire leaves the head straight.
+             - snap arms      two long side arms, rooted only at the rear, that
+                              hook over the lid.
+             - lid stops      four blocks on the side walls, fore and aft of the
+                              lid, that locate it along the wire run.
+    Lid    a flat plate with one rib per used channel.  Nothing else -- no
+           rails, no barbs, no flexures.
+
+Assembly: drop each jumper in from above (head into its pocket, wire into its
+channel), then press the lid straight down until both arms click over it.
+Nothing slides along anything, and nothing has to be threaded over a head.
+
+Why the arms are on the CLIP and not the lid:
+
+    A snap arm has to be long to survive the strain of being spread.  On the
+    lid, a long arm can only run along the wire run, and freeing it means
+    cutting it away from the lid's own plate -- which leaves it dangling in mid
+    air once the lid is flipped onto its plate for printing.  On the clip the
+    same arm stands up off the build plate along its whole length: supported
+    while printing, and free to bend once printed, because the only thing
+    joining it to the clip is its root at the rear.
+
+    Consequence worth knowing: the arms are very compliant (see the printed
+    report), which is fine.  Retention does not come from arm stiffness -- the
+    barb's retaining face is horizontal, so pulling the lid loads the arm
+    axially and it cannot cam its way out.  The joint releases only by pushing
+    both arms outward, which is deliberate.
+
+Clearances are named for what they do; none of them are interchangeable:
+
+    head_gap    per side, around the head row (X) and above it (Z).  How
+                snugly the jumpers are held.
+    slip        per side, between clip and lid.  A drop-on fit for a part that
+                is snapped, not slid.
+    snap_clr    play inside the snap engagement, i.e. how far the lid can lift
+                before the barbs catch.
+    wire_gap    per side, around the wire in its channel.
+    rib_clr     gap left over the wire under the lid rib.
+    bore_comp   printer compensation, per side, added to internal openings
+                ONLY.  Design intent stays in the numbers above; this one is a
+                property of the machine.  Measure a printed opening against the
+                model number this macro reports and put half the difference
+                here.  0.0 leaves every dimension exactly as designed.
+
+Every derived number comes from derived(); no builder recomputes the stack-up.
+"""
+
+import hashlib
+import math
+import os
+import FreeCAD as App
+import Part
+from FreeCAD import Vector as V
+
+__title__ = "DupontClipGen"
+__author__ = "generated for the WireGuide project"
+
+
+# --------------------------------------------------------------------------
+# parameters
+# --------------------------------------------------------------------------
+
+DEFAULTS = dict(
+    n_positions   = 4,       # connector positions; the row stays full size
+    used          = "all",   # "all", "1-6", "1,3,5-7" ... 1-based
+    pitch         = 2.54,
+    wire_dia      = 1.6,
+
+    # measured on the user's jumpers -- these are inputs, not guesses
+    head_w        = 2.5,     # head, across the row
+    head_h        = 2.2,     # head, through the row (vertical here)
+    head_len      = 14.0,    # head, along the wire run
+
+    head_gap      = 0.15,    # per side, around the head row
+    head_slack    = 0.3,     # end float for the head along the wire run
+    head_lip      = 0.6,     # height of the front lip that retains the heads
+    front_wall    = 1.2,     # thickness of the front lip
+
+    guide_len     = 14.0,    # wire channel section
+    base_thk      = 1.0,     # material under the pocket floor
+    side_wall     = 1.2,     # clip outer side wall
+    rear_wall     = 2.0,     # rear lid stop / arm root block
+
+    lid_plate     = 1.4,
+    lid_corner_r  = 0.4,     # plan corners of the lid.  Clamped in derived():
+                             # the corner radius comes straight off the lid
+                             # stops' engagement, because the stops can only
+                             # sit on the side wall tops.
+    wire_gap      = 0.05,    # per side, around the wire in its channel.  Small
+                             # on purpose: the channel wall is only
+                             # (pitch - wire_dia)/2 to start with, so every
+                             # 0.05 here costs 0.05 of wall.
+    rib_clr       = 0.15,    # gap the lid rib leaves over the wire
+    slip          = 0.15,    # clip-to-lid fit, per side
+    bore_comp     = 0.0,     # printer compensation, per side, openings only
+
+    arm_thk       = 1.2,
+    arm_gap       = 0.4,     # air gap between arm and clip wall; >= 1 nozzle
+    snap_reach    = 0.5,     # how far the barb overhangs the lid
+    snap_clr      = 0.10,    # lid lift before the barbs catch
+
+    e_modulus     = 2500.0,  # PLA, MPa -- only used for the printed force /
+                             # strain estimate, not for any geometry
+    spacing       = 12.0,    # layout gap between parts in the document
+
+    export        = True,    # write STLs on every generate()
+    out_dir       = None,    # None -> <this macro's directory>/generated
+)
+
+
+def parse_used(spec, n):
+    """'all' | '1-6' | '1,3,5-7'  ->  sorted set of 0-based indices."""
+    spec = str(spec).strip().lower()
+    if spec in ("", "all", "*"):
+        return set(range(n))
+    out = set()
+    for chunk in spec.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            for i in range(int(a), int(b) + 1):
+                out.add(i - 1)
+        else:
+            out.add(int(chunk) - 1)
+    bad = sorted(i + 1 for i in out if i < 0 or i >= n)
+    if bad:
+        raise ValueError("positions out of range 1..%d: %s" % (n, bad))
+    return out
+
+
+# --------------------------------------------------------------------------
+# naming -- one slug, used for the document, the .FCStd and the STLs
+# --------------------------------------------------------------------------
+#
+# A name has to say WHICH positions are wired and what shape of head, not just
+# how many.  The old "%dway" and "%dp_%dused" forms did not: a 6-way with pins
+# 1,3,5 wired overwrote a fully wired 6-way, and a 2.54-square head overwrote a
+# 2.50 x 2.20 one.  Nothing warned -- the file just changed under you.
+#
+# The slug names the four things that identify a connector: positions, which of
+# them are used, pitch, and head shape.  Every OTHER geometry parameter is
+# folded into a short `cfgXXXX` tag that appears only when one of them differs
+# from DEFAULTS, so ordinary names stay readable but no two different solids can
+# ever land on the same filename.  Fields are separated by "_" so a range inside
+# the position list ("p1-3.5") stays unambiguous.
+
+SLUG_KEYS = ("n_positions", "used", "pitch", "head_w", "head_h", "head_len")
+UNPRINTED = ("spacing", "e_modulus", "export", "out_dir")   # affect no geometry
+
+
+def _num(x):
+    """2.54 -> '2.54',  2.50 -> '2.5',  14.0 -> '14'.  One spelling per value."""
+    s = ("%.3f" % float(x)).rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def used_slug(used, n):
+    """Canonical, built from the PARSED set, so 'all' and '1-4' at n=4 agree.
+
+    If this were built from the input string instead, two spellings of one
+    geometry would produce two filenames -- the mirror image of the bug it is
+    here to fix.
+    """
+    if set(used) == set(range(n)):
+        return "all"
+    xs = sorted(i + 1 for i in used)
+    runs, start, prev = [], xs[0], xs[0]
+    for v in xs[1:]:
+        if v == prev + 1:
+            prev = v
+            continue
+        runs.append((start, prev))
+        start = prev = v
+    runs.append((start, prev))
+    return "p" + ".".join("%d" % a if a == b else "%d-%d" % (a, b)
+                          for a, b in runs)
+
+
+def config_tag(P):
+    """'cfg3f2a' when any geometry parameter outside the slug is off-default."""
+    def digest(d):
+        items = []
+        for k in sorted(d):
+            if k in SLUG_KEYS or k in UNPRINTED:
+                continue
+            v = d[k]
+            items.append("%s=%s" % (k, _num(v) if isinstance(v, (int, float))
+                                    else v))
+        return hashlib.md5(";".join(items).encode("utf-8")).hexdigest()[:4]
+    t = digest(dict(DEFAULTS, **P))
+    return "" if t == digest(dict(DEFAULTS)) else "cfg" + t
+
+
+def slug(P, used, part=None):
+    n = int(P["n_positions"])
+    out = ["DupontClip", "%dway" % n, used_slug(used, n),
+           _num(P["pitch"]) + "mm",
+           "%sx%sx%s" % (_num(P["head_w"]), _num(P["head_h"]),
+                         _num(P["head_len"]))]
+    tag = config_tag(P)
+    if tag:
+        out.append(tag)
+    if part:
+        out.append(part)
+    return "_".join(out)
+
+
+def repo_root():
+    """The project directory, found from this file rather than hardcoded.
+
+    realpath() matters twice over: the macro is a SYMLINK from the FreeCAD macro
+    directory into the repo, so without it the output would land next to the
+    link, in FreeCAD's own config directory.  And the macro sits in `macros/`
+    inside the repo, so resolving it lands one level too deep.
+    """
+    try:
+        here = os.path.dirname(os.path.realpath(__file__))
+    except NameError:                        # exec'd without a __file__
+        return os.path.expanduser("~/projects/WireGuide")
+    if os.path.basename(here) == "macros":
+        here = os.path.dirname(here)
+    return here
+
+
+def default_out_dir():
+    return os.path.join(repo_root(), "generated")
+
+
+def out_dir_for(P):
+    d = P.get("out_dir") or default_out_dir()
+    return os.path.expanduser(d)
+
+
+# --------------------------------------------------------------------------
+# the dimensional chain -- single source of truth
+# --------------------------------------------------------------------------
+
+def derived(P):
+    n, pitch = int(P["n_positions"]), P["pitch"]
+    bc = P["bore_comp"]
+    D = {}
+
+    D["hx"] = P["head_gap"] + bc                 # per side, head row in X
+    D["hz"] = P["head_gap"] + bc                 # above the head row
+    D["g"] = P["slip"] + bc                      # clip-to-lid, per side
+
+    # X: head centres, and the widths that follow from them.  Driven off the
+    # measured head, not off n*pitch: n*pitch assumes one pitch of housing per
+    # position, but the real envelope is (n-1) pitches between centres plus one
+    # head width.
+    D["x_pos"] = [(i - (n - 1) / 2.0) * pitch for i in range(n)]
+    D["row_w"] = (n - 1) * pitch + P["head_w"]
+    D["pw"] = D["row_w"] + 2 * D["hx"]           # pocket, inside the side walls
+    D["bw"] = D["pw"] + 2 * P["side_wall"]       # clip outer width
+    D["slot_w"] = P["head_w"] + 2 * D["hx"]      # one head slot
+
+    # Z: the head rests on the pocket floor at z=0, so every height is
+    # measured from there.
+    D["base_thk"] = P["base_thk"]
+    D["ph"] = P["head_h"] + D["hz"]              # pocket depth = lid seat
+    D["z_cf"] = P["head_h"] / 2.0 - P["wire_dia"] / 2.0   # channel floor:
+    #   puts the channel axis on the head axis, so the wire runs straight out
+    #   of the head instead of being kinked at the transition.
+    D["ch_w"] = P["wire_dia"] + 2 * (P["wire_gap"] + bc)
+    D["ch_d"] = D["ph"] - D["z_cf"]
+    D["rib_d"] = max(0.0, D["ch_d"] - P["wire_dia"] - P["rib_clr"])
+    D["rib_w"] = max(0.4, D["ch_w"] - 2 * D["g"])
+    D["head_clr_z"] = D["hz"] + P["snap_clr"]    # total head lift available
+
+    # Y: stations along the wire run
+    D["y_fw"] = P["front_wall"]
+    D["y_p1"] = D["y_fw"] + P["head_len"] + P["head_slack"]
+    D["y_end"] = D["y_p1"] + P["guide_len"]
+
+    # lid
+    D["lid_w"] = D["bw"] - 2 * D["g"]
+    D["lid_y0"] = D["y_fw"]
+    D["lid_y1"] = D["y_end"] - P["rear_wall"]
+    D["lid_top"] = D["ph"] + P["lid_plate"]
+    # A lid stop can only stand on a side wall top, so it overlaps the lid over
+    # side_wall - slip, and the lid's corner radius is subtracted from that
+    # straight overlap.  Clamp the radius so at least MIN_STOP survives.
+    MIN_STOP = 0.4
+    D["lid_r"] = max(0.0, min(P["lid_corner_r"],
+                              P["side_wall"] - D["g"] - MIN_STOP))
+    D["stop_overlap"] = P["side_wall"] - D["g"] - D["lid_r"]
+
+    # snap arms
+    D["arm_x_in"] = D["bw"] / 2.0 + P["arm_gap"]
+    D["arm_x_out"] = D["arm_x_in"] + P["arm_thk"]
+    D["barb_tip"] = D["lid_w"] / 2.0 - P["snap_reach"]
+    D["barb_p"] = D["arm_x_in"] - D["barb_tip"]           # total overhang
+    D["barb_relief"] = D["arm_x_in"] - D["lid_w"] / 2.0   # 45 deg, not a ledge
+    D["barb_z0"] = D["lid_top"] + P["snap_clr"]           # retaining face
+    D["arm_z1"] = D["barb_z0"] + D["barb_p"]              # 45 deg lead-in top
+    D["arm_y0"] = D["y_fw"]
+    D["arm_y1"] = D["lid_y1"]                             # free length ends here
+    D["arm_len"] = D["arm_y1"] - D["arm_y0"]
+    return D
+
+
+def blank_residual(P, D):
+    """Solid left at a blanked position whose neighbours are both open.
+
+    The head slot is wider than the pitch, so adjacent slots overlap and a full
+    row becomes one trough.  A blanked position only loses that overlap from
+    each side, so it keeps 2*pitch - slot_w of solid rib.  Do NOT clamp the
+    slot to the pitch to stop the overlap: with a 2.50 head on a 2.54 pitch
+    that leaves +0.02 a side, which is a press fit, not a clearance fit.
+    """
+    return 2 * P["pitch"] - D["slot_w"]
+
+
+def arm_mechanics(P, D):
+    """Spread force and root strain for one snap arm, as a cantilever.
+
+    Not used by any geometry -- it is here because the arm is the one feature
+    whose failure mode is invisible in the model.  The previous design's rails
+    were geometrically fine and still unassemblable.
+    """
+    t, L = P["arm_thk"], D["arm_len"]
+    h = D["arm_z1"] + D["base_thk"]              # arm height, bed to barb top
+    d = P["snap_reach"]                          # spread needed to admit the lid
+    I = h * t ** 3 / 12.0
+    F = 3.0 * P["e_modulus"] * I * d / L ** 3
+    strain = 3.0 * t * d / (2.0 * L ** 2)
+    return dict(force=F, strain=strain, arm_h=h, arm_len=L, spread=d)
+
+
+# --------------------------------------------------------------------------
+# geometry helpers
+# --------------------------------------------------------------------------
+
+def box(x0, y0, z0, dx, dy, dz):
+    return Part.makeBox(dx, dy, dz, V(x0, y0, z0))
+
+
+def rrect_wire(w, h, r, z=0.0):
+    """Rounded rectangle wire centred on the origin, in XY at height z.
+
+    Edges are emitted in a fixed order from a fixed corner so two wires from
+    this function correspond edge for edge.  Kept from WireGuideGen because
+    Part.Face(...).OuterWire reorders edges, which silently twists any loft
+    built from them.
+    """
+    a, b = w / 2.0, h / 2.0
+    r = max(0.0, min(r, a - 1e-6, b - 1e-6))
+    if r <= 1e-9:
+        pts = [V(-a, -b, z), V(a, -b, z), V(a, b, z), V(-a, b, z), V(-a, -b, z)]
+        return Part.makePolygon(pts)
+    ca, cb = a - r, b - r
+    e = [Part.LineSegment(V(-ca, -b, z), V(ca, -b, z)).toShape(),
+         Part.ArcOfCircle(Part.Circle(V(ca, -cb, z), V(0, 0, 1), r),
+                          -math.pi / 2, 0).toShape(),
+         Part.LineSegment(V(a, -cb, z), V(a, cb, z)).toShape(),
+         Part.ArcOfCircle(Part.Circle(V(ca, cb, z), V(0, 0, 1), r),
+                          0, math.pi / 2).toShape(),
+         Part.LineSegment(V(ca, b, z), V(-ca, b, z)).toShape(),
+         Part.ArcOfCircle(Part.Circle(V(-ca, cb, z), V(0, 0, 1), r),
+                          math.pi / 2, math.pi).toShape(),
+         Part.LineSegment(V(-a, cb, z), V(-a, -cb, z)).toShape(),
+         Part.ArcOfCircle(Part.Circle(V(-ca, -cb, z), V(0, 0, 1), r),
+                          math.pi, 3 * math.pi / 2).toShape()]
+    return Part.Wire(e)
+
+
+# --------------------------------------------------------------------------
+# part builders   (X = across the row, Y = the wire run, Z = up)
+# --------------------------------------------------------------------------
+
+def build_clip(P, D, used):
+    bw, pw, ph = D["bw"], D["pw"], D["ph"]
+    base, y_end = D["base_thk"], D["y_end"]
+
+    s = box(-bw / 2.0, 0.0, -base, bw, y_end, base + ph)
+
+    # open the front above the lip.  The lip keeps the heads in: to escape
+    # forwards a head would have to rise head_lip, and the lid only lets it
+    # rise head_clr_z.  Nothing here overhangs.
+    s = s.cut(box(-pw / 2.0, 0.0, P["head_lip"],
+                  pw, D["y_fw"], ph - P["head_lip"] + 1.0))
+
+    # head pockets: cut only the used positions, leaving unused ones as ribs
+    for i in sorted(used):
+        s = s.cut(box(D["x_pos"][i] - D["slot_w"] / 2.0, D["y_fw"], 0.0,
+                      D["slot_w"], D["y_p1"] - D["y_fw"], ph + 1.0))
+
+    # wire channels, open along the whole guide and out the back
+    for i in sorted(used):
+        s = s.cut(box(D["x_pos"][i] - D["ch_w"] / 2.0, D["y_p1"], D["z_cf"],
+                      D["ch_w"], y_end - D["y_p1"] + 1.0, D["ch_d"] + 1.0))
+
+    # lid stops: on the side wall tops only, so the wire exit stays open to the
+    # sky -- a jumper's far end will not thread through a closed slot.
+    g = D["g"]
+    for x0 in (-bw / 2.0, pw / 2.0):
+        s = s.fuse(box(x0, 0.0, ph, P["side_wall"], D["y_fw"] - g, P["lid_plate"]))
+        s = s.fuse(box(x0, D["lid_y1"] + g, ph,
+                       P["side_wall"], y_end - D["lid_y1"] - g, P["lid_plate"]))
+
+    # snap arms + root blocks
+    for sgn in (-1.0, 1.0):
+        xi = sgn * D["arm_x_in"]
+        xo = sgn * D["arm_x_out"]
+        x0, dx = min(xi, xo), abs(xo - xi)
+        # the arm proper: free over its whole length, joined only at the root
+        s = s.fuse(box(x0, D["arm_y0"], -base, dx,
+                       D["arm_y1"] - D["arm_y0"], D["arm_z1"] + base))
+        # root block: fills the air gap at the rear and ties the arm to the clip
+        s = s.fuse(box(min(sgn * bw / 2.0, xo), D["arm_y1"], -base,
+                       abs(xo) - bw / 2.0, y_end - D["arm_y1"], D["arm_z1"] + base))
+        # Barb: a hook whose retaining face is horizontal and exactly
+        # snap_reach wide -- only the part that actually overlaps the lid.  The
+        # rest of the reach, which merely spans the arm gap and the slip fit,
+        # rises at 45 deg, so the only unsupported ledge the clip has to print
+        # is snap_reach wide instead of the full reach.  Above the retaining
+        # face is a 45 deg lead-in that lets the lid cam the arm open as it
+        # goes down.
+        z0 = D["barb_z0"]
+        y0, dy = D["arm_y0"], D["arm_y1"] - D["arm_y0"]
+        pts = [V(xi, y0, z0 + D["barb_relief"]),        # on the arm face
+               V(sgn * D["lid_w"] / 2.0, y0, z0),       # over the lid edge
+               V(sgn * D["barb_tip"], y0, z0),          # tip
+               V(xi, y0, z0 + D["barb_p"]),             # top of the lead-in
+               V(xi, y0, z0 + D["barb_relief"])]
+        hook = Part.Face(Part.makePolygon(pts))
+        s = s.fuse(hook.extrude(V(0, dy, 0)))
+
+    return s.removeSplitter()
+
+
+def build_lid(P, D, used):
+    w = D["lid_w"]
+    L = D["lid_y1"] - D["lid_y0"]
+    r = min(D["lid_r"], w / 2.0 - 1e-3, L / 2.0 - 1e-3)
+
+    plate = Part.Face(rrect_wire(w, L, r, D["ph"])).extrude(V(0, 0, P["lid_plate"]))
+    plate.translate(V(0, D["lid_y0"] + L / 2.0, 0))
+
+    # one rib per used channel, leaving rib_clr over the wire
+    if D["rib_d"] > 1e-6:
+        for i in sorted(used):
+            plate = plate.fuse(box(D["x_pos"][i] - D["rib_w"] / 2.0, D["y_p1"],
+                                   D["ph"] - D["rib_d"],
+                                   D["rib_w"], D["lid_y1"] - D["y_p1"],
+                                   D["rib_d"]))
+    return plate.removeSplitter()
+
+
+# --------------------------------------------------------------------------
+# mocks -- display and verification only, never printed
+# --------------------------------------------------------------------------
+
+def build_heads(P, D, used):
+    """Jumper heads at their nominal seat: on the pocket floor, against the lip."""
+    out = []
+    for i in sorted(used):
+        out.append(box(D["x_pos"][i] - P["head_w"] / 2.0, D["y_fw"], 0.0,
+                       P["head_w"], P["head_len"], P["head_h"]))
+    return out
+
+
+def build_wires(P, D, used):
+    """Wire, on the head axis, from the back of the head out past the clip."""
+    out = []
+    zc = P["head_h"] / 2.0
+    y0 = D["y_fw"] + P["head_len"]
+    for i in sorted(used):
+        c = Part.makeCylinder(P["wire_dia"] / 2.0, D["y_end"] - y0 + 4.0,
+                              V(D["x_pos"][i], y0, zc), V(0, 1, 0))
+        out.append(c)
+    return out
+
+
+def build_pins(P, D, used):
+    """Header pin, 0.64 square, entering the front window into each head."""
+    out = []
+    zc = P["head_h"] / 2.0
+    for i in sorted(used):
+        out.append(box(D["x_pos"][i] - 0.32, -6.0, zc - 0.32,
+                       0.64, 6.0 + D["y_fw"] + 1.0, 0.64))
+    return out
+
+
+# --------------------------------------------------------------------------
+# print orientation
+# --------------------------------------------------------------------------
+#
+#   Clip  as built.  The base underside is the largest flat face and every
+#         feature -- pocket, channels, front lip, arms -- opens upward.  The
+#         only downward faces in the whole part are the barbs' retaining
+#         faces, barb_p wide.
+#   Lid   flipped.  Its plate is the largest flat face; flipping puts it on the
+#         bed and stands the ribs up in the air.
+#
+PRINT_POSE = {"Clip": (None, 0.0), "Lid": (V(1, 0, 0), 180.0)}
+
+
+def pose_for_print(shape, axis, angle):
+    """Rotate into the print pose, then seat the part on the Z=0 bed plane."""
+    s = shape.copy()
+    if axis is not None and abs(angle) > 1e-9:
+        s.rotate(V(0, 0, 0), axis, angle)
+    bb = s.BoundBox
+    s.translate(V(-bb.XMin, -bb.YMin, -bb.ZMin))
+    return s
+
+
+# --------------------------------------------------------------------------
+# document assembly
+# --------------------------------------------------------------------------
+
+def generate(params=None, doc=None, mocks=False, posed=True):
+    P = dict(DEFAULTS)
+    P.update(params or {})
+    n = int(P["n_positions"])
+    used = parse_used(P["used"], n)
+    D = derived(P)
+
+    if P["wire_dia"] >= P["pitch"]:
+        raise ValueError("wire_dia (%.3f) must be less than pitch (%.3f)"
+                         % (P["wire_dia"], P["pitch"]))
+    if P["head_lip"] <= D["head_clr_z"]:
+        raise ValueError("head_lip (%.3f) must exceed the head's vertical play "
+                         "(%.3f) or the heads can climb over the front lip"
+                         % (P["head_lip"], D["head_clr_z"]))
+    if D["z_cf"] < 0:
+        raise ValueError("wire_dia (%.3f) exceeds head_h (%.3f)"
+                         % (P["wire_dia"], P["head_h"]))
+
+    name = slug(P, used)
+    if doc is None:
+        # FreeCAD's internal document name has to be a plain identifier, so the
+        # dots and dashes go in the Label instead of being silently mangled.
+        doc = App.newDocument(name.replace(".", "p").replace("-", "_"))
+        doc.Label = name
+
+    parts = [("Clip", build_clip(P, D, used), (1.00, 0.35, 0.35)),
+             ("Lid", build_lid(P, D, used), (0.30, 0.55, 1.00))]
+
+    y = 0.0
+    for name, shape, col in parts:
+        if posed:
+            axis, angle = PRINT_POSE[name]
+            shape = pose_for_print(shape, axis, angle)
+            shape.translate(V(0, y, 0))
+            y += shape.BoundBox.YLength + P["spacing"]
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        if obj.ViewObject:
+            obj.ViewObject.ShapeColor = col
+
+    if mocks:
+        for label, shapes, col in (
+                ("HeadMock", build_heads(P, D, used), (0.20, 0.20, 0.20)),
+                ("WireMock", build_wires(P, D, used), (0.90, 0.75, 0.10)),
+                ("PinMock", build_pins(P, D, used), (0.70, 0.70, 0.75))):
+            o = doc.addObject("Part::Feature", label)
+            o.Shape = Part.Compound(shapes)
+            if o.ViewObject:
+                o.ViewObject.ShapeColor = col
+
+    doc.recompute()
+    report(P, D, used)
+    if P.get("export"):
+        # only the print-posed parts are exportable: an unposed part is not
+        # seated on the bed, and the slicer would start it in mid air
+        if posed:
+            for path in export_stls(doc, P, used):
+                print("  wrote %s" % path)
+        else:
+            print("  export skipped: parts are not in their print pose")
+    return doc
+
+
+STL_DEVIATION = 0.02        # mm; only the lid's corner arcs are curved at all
+
+
+def write_stl(shape, path):
+    """Binary STL at a controlled deviation.
+
+    Not Shape.exportStl(): that writes ASCII, which is ~5x the size and rewrites
+    as thousands of text lines every run -- unpleasant in version control.  The
+    deviation is set explicitly rather than inherited from FreeCAD's preferences,
+    so the file does not change depending on whose machine produced it.
+    """
+    try:
+        import Mesh
+        pts, facets = shape.tessellate(STL_DEVIATION)
+        Mesh.Mesh([[pts[i] for i in f] for f in facets]).write(path)
+    except ImportError:                      # no Mesh module: ASCII will do
+        shape.exportStl(path)
+
+
+def export_stls(doc, P, used):
+    """Write one STL per part into out_dir, named by slug().  Returns the paths."""
+    d = out_dir_for(P)
+    if not os.path.isdir(d):
+        os.makedirs(d)
+    out = []
+    for part in ("Clip", "Lid"):
+        obj = doc.getObject(part)
+        if obj is None:
+            continue
+        path = os.path.join(d, slug(P, used, part) + ".stl")
+        write_stl(obj.Shape, path)
+        out.append(path)
+    return out
+
+
+def report(P, D, used):
+    n = int(P["n_positions"])
+    blanked = sorted(i + 1 for i in set(range(n)) - used)
+    res = blank_residual(P, D)
+    m = arm_mechanics(P, D)
+    print("DupontClipGen  %d positions, %d used %s"
+          % (n, len(used), sorted(i + 1 for i in used)))
+    print("  name: %s" % slug(P, used))
+    print("  head %.2f x %.2f x %.2f, pitch %.2f, wire %.2f"
+          % (P["head_w"], P["head_h"], P["head_len"], P["pitch"], P["wire_dia"]))
+    print("  openings = head_gap %.2f / slip %.2f + bore_comp %.2f a side"
+          % (P["head_gap"], P["slip"], P["bore_comp"]))
+    print("  head row %.2f -> pocket %.2f -> clip %.2f wide; slot %.2f per head"
+          % (D["row_w"], D["pw"], D["bw"], D["slot_w"]))
+    print("  pocket %.2f deep (head %.2f + %.2f); lid seats at z=%.2f, top %.2f"
+          % (D["ph"], P["head_h"], D["hz"], D["ph"], D["lid_top"]))
+    print("  channel %.2f wide x %.2f deep, floor z=%.2f (on the head axis); "
+          "rib %.2f deep leaves %.2f on the wire"
+          % (D["ch_w"], D["ch_d"], D["z_cf"], D["rib_d"], P["rib_clr"]))
+    print("  front lip %.2f high vs head vertical play %.2f  ->  %s"
+          % (P["head_lip"], D["head_clr_z"],
+             "retained" if P["head_lip"] > D["head_clr_z"] else "CAN ESCAPE"))
+    print("  blanked %s; rib left between two open slots %.2f  ->  %s"
+          % (blanked or "none", res,
+             "blocks a %.2f head" % P["head_w"] if res < P["head_w"]
+             else "TOO WIDE -- a head could pass"))
+    print("  snap arm %.1f long x %.2f thick x %.2f tall, spreads %.2f:"
+          % (m["arm_len"], P["arm_thk"], m["arm_h"], m["spread"]))
+    print("        %.2f N per arm, root strain %.2f%%  %s"
+          % (m["force"], 100 * m["strain"],
+             "(PLA yields near 2%)" if m["strain"] < 0.015
+             else "*** TOO STIFF -- lengthen the arm or thin it ***"))
+    wall = (P["pitch"] - D["ch_w"]) / 2.0
+    print("  thin features: channel wall %.3f, lid rib %.3f, arm gap %.3f  %s"
+          % (wall, D["rib_w"], P["arm_gap"],
+             "" if min(wall, D["rib_w"], P["arm_gap"]) >= 0.40
+             else "*** under one 0.40 nozzle width ***"))
+    print("  unsupported ledge: %.2f wide under each barb (nothing else "
+          "overhangs)" % P["snap_reach"])
+    print("  lid stops overlap the lid's straight edge by %.2f "
+          "(corner r %.2f of %.2f asked)"
+          % (D["stop_overlap"], D["lid_r"], P["lid_corner_r"]))
+    print("  heads sit %.2f proud of whatever the front face lands on; "
+          "reduce front_wall to seat them deeper" % P["front_wall"])
+    print("  overall %.2f wide x %.2f long x %.2f tall"
+          % (2 * D["arm_x_out"], D["y_end"], D["arm_z1"] + D["base_thk"]))
+
+
+# --------------------------------------------------------------------------
+# dialog
+# --------------------------------------------------------------------------
+
+FIELDS = [("n_positions", "Connector positions", "int"),
+          ("used", "Positions used (e.g. 1-6)", "str"),
+          ("pitch", "Pitch (mm)", "float"),
+          ("wire_dia", "Wire diameter (mm)", "float"),
+          ("head_w", "Head width, across row (mm)", "float"),
+          ("head_h", "Head height, through row (mm)", "float"),
+          ("head_len", "Head length, along run (mm)", "float"),
+          ("head_gap", "Head clearance (mm/side)", "float"),
+          ("head_lip", "Front lip height (mm)", "float"),
+          ("guide_len", "Wire guide length (mm)", "float"),
+          ("wire_gap", "Wire clearance (mm/side)", "float"),
+          ("slip", "Clip-to-lid fit (mm/side)", "float"),
+          ("bore_comp", "Printer bore comp (mm/side)", "float"),
+          ("snap_reach", "Snap barb reach (mm)", "float"),
+          ("arm_thk", "Snap arm thickness (mm)", "float"),
+          ("lid_plate", "Lid plate thickness (mm)", "float")]
+
+
+def show_dialog():
+    from PySide import QtWidgets
+
+    dlg = QtWidgets.QDialog()
+    dlg.setWindowTitle("Dupont Clip Generator")
+    form = QtWidgets.QFormLayout(dlg)
+    widgets = {}
+    for key, label, kind in FIELDS:
+        w = QtWidgets.QLineEdit(str(DEFAULTS[key]))
+        form.addRow(label, w)
+        widgets[key] = (w, kind)
+    show_mocks = QtWidgets.QCheckBox()
+    form.addRow("Add jumper / wire / pin mocks", show_mocks)
+    do_export = QtWidgets.QCheckBox()
+    do_export.setChecked(bool(DEFAULTS["export"]))
+    form.addRow("Export STLs to generated/", do_export)
+    out_edit = QtWidgets.QLineEdit(default_out_dir())
+    form.addRow("Output directory", out_edit)
+
+    box_ = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok
+                                      | QtWidgets.QDialogButtonBox.Cancel)
+    form.addRow(box_)
+    box_.accepted.connect(dlg.accept)
+    box_.rejected.connect(dlg.reject)
+    if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        return None
+
+    params = {}
+    for key, (w, kind) in widgets.items():
+        t = w.text().strip()
+        params[key] = int(t) if kind == "int" else (float(t) if kind == "float" else t)
+    params["export"] = do_export.isChecked()
+    params["out_dir"] = out_edit.text().strip() or None
+    try:
+        return generate(params, mocks=show_mocks.isChecked())
+    except Exception as exc:
+        QtWidgets.QMessageBox.critical(dlg, "Dupont Clip Generator", str(exc))
+        raise
+
+
+if __name__ == "__main__":
+    show_dialog()

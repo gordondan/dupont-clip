@@ -1,0 +1,13 @@
+# FreeCAD's own rolling backups
+*.FCBak
+
+# superseded by generated/, kept on disk only until it is confirmed unwanted
+ToPrint/
+
+# stale slicer projects from the hand-built era
+*.old.3mf
+*.old.*.3mf
+
+__pycache__/
+*.pyc
+.DS_Store
